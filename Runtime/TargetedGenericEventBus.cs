@@ -205,6 +205,22 @@ namespace GenericEventBus
 		}
 
 		/// <summary>
+		/// Subscribe to a given event type, but only if it comes from and targets given objects.
+		/// </summary>
+		/// <param name="source">The source object.</param>
+		/// <param name="target">The target object.</param>
+		/// <param name="handler">The method that should be invoked when the event is raised.</param>
+		/// <param name="priority">Higher priority means this listener will receive the event earlier than other listeners with lower priority.
+		///                        If multiple listeners have the same priority, they will be invoked in the order they subscribed.</param>
+		/// <typeparam name="TEvent">The event type to subscribe to.</typeparam>
+		public void SubscribeToSourceAndTarget<TEvent>(TObject source, TObject target, TargetedEventHandler<TEvent> handler, float priority = 0)
+			where TEvent : TBaseEvent
+		{
+			var listeners = TargetedEventListeners<TEvent>.Get(this);
+			listeners.AddSourceAndTargetListener(source, target, handler, priority);
+		}
+
+		/// <summary>
 		/// Unsubscribe from a given event type, but only if it comes from the given object.
 		/// </summary>
 		/// <param name="source">The source object.</param>
@@ -215,6 +231,20 @@ namespace GenericEventBus
 		{
 			var listeners = TargetedEventListeners<TEvent>.Get(this);
 			listeners.RemoveSourceListener(source, handler);
+		}
+
+		/// <summary>
+		/// Unsubscribe from a given event type, but only if it comes from and targets given objects.
+		/// </summary>
+		/// <param name="source">The source object.</param>
+		/// <param name="target">The target object.</param>
+		/// <param name="handler">The method that was previously given in SubscribeToSource.</param>
+		/// <typeparam name="TEvent">The event type to unsubscribe from.</typeparam>
+		public void UnsubscribeFromSourceAndTarget<TEvent>(TObject source, TObject target, TargetedEventHandler<TEvent> handler)
+			where TEvent : TBaseEvent
+		{
+			var listeners = TargetedEventListeners<TEvent>.Get(this);
+			listeners.RemoveSourceAndTargetListener(source, target, handler);
 		}
 
 		protected override void ClearAllListeners<TEvent>()
@@ -266,6 +296,10 @@ namespace GenericEventBus
 
 			private readonly Dictionary<TObject, List<Listener>> _sourceListeners =
 				new Dictionary<TObject, List<Listener>>();
+
+			private readonly Dictionary<(TObject, TObject), List<Listener>> _sourceAndTargetListeners =
+				new Dictionary<(TObject, TObject), List<Listener>>();
+
 
 			private readonly List<Enumerator> _activeEnumerators = new List<Enumerator>(4);
 
@@ -409,6 +443,37 @@ namespace GenericEventBus
 					}
 				}
 			}
+			
+			public void AddSourceAndTargetListener(TObject source, TObject target, TargetedEventHandler<TEvent> handler, float priority)
+			{
+				if (_eventBus.IsDefaultObject(source)) return;
+				if (_eventBus.IsDefaultObject(target)) return;
+
+				var key = (source, target);
+				if (!_sourceAndTargetListeners.TryGetValue(key, out var listeners))
+				{
+					listeners = ListenerListPool.Get();
+
+					_sourceAndTargetListeners[key] = listeners;
+				}
+
+				var listener = new Listener(handler, priority);
+
+				var index = listeners.InsertIntoSortedList(listener);
+
+				foreach (var enumerator in _activeEnumerators)
+				{
+					if (!ObjectComparer.Equals(source, enumerator.Source)) continue;
+					if (!ObjectComparer.Equals(target, enumerator.Target)) continue;
+
+					enumerator.SourceAndTargetListeners = listeners;
+
+					if (enumerator.SourceAndTargetIndex > index)
+					{
+						enumerator.SourceAndTargetIndex++;
+					}
+				}
+			}
 
 			public void RemoveSourceListener(TObject source, TargetedEventHandler<TEvent> handler)
 			{
@@ -440,6 +505,41 @@ namespace GenericEventBus
 				{
 					ListenerListPool.Release(listeners);
 					_sourceListeners.Remove(source);
+				}
+			}
+
+			public void RemoveSourceAndTargetListener(TObject source,TObject target, TargetedEventHandler<TEvent> handler)
+			{
+				var key = (source, target);
+				if (!_sourceAndTargetListeners.TryGetValue(key, out var listeners)) return;
+
+				for (var i = listeners.Count - 1; i >= 0; i--)
+				{
+					if (!Equals(listeners[i].Handler, handler)) continue;
+
+					listeners.RemoveAt(i);
+
+					foreach (var enumerator in _activeEnumerators)
+					{
+						if (!ObjectComparer.Equals(source, enumerator.Source)) continue;
+						if (!ObjectComparer.Equals(target, enumerator.Target)) continue;
+
+						if (enumerator.SourceAndTargetIndex >= i && enumerator.SourceAndTargetIndex > 0)
+						{
+							enumerator.SourceAndTargetIndex--;
+						}
+
+						if (listeners.Count == 0)
+						{
+							enumerator.SourceAndTargetListeners = null;
+						}
+					}
+				}
+
+				if (listeners.Count == 0)
+				{
+					ListenerListPool.Release(listeners);
+					_sourceAndTargetListeners.Remove(key);
 				}
 			}
 
@@ -511,7 +611,9 @@ namespace GenericEventBus
 				enumerator.Owner = this;
 				enumerator.SortedListeners = _sortedListeners;
 
-				if (!_eventBus.IsDefaultObject(target))
+				bool targetIsDefault = _eventBus.IsDefaultObject(target);
+				bool sourceIsDefault = _eventBus.IsDefaultObject(source);
+				if (!targetIsDefault)
 				{
 					enumerator.Target = target;
 
@@ -521,13 +623,22 @@ namespace GenericEventBus
 					}
 				}
 
-				if (!_eventBus.IsDefaultObject(source))
+				if (!sourceIsDefault)
 				{
 					enumerator.Source = source;
 
 					if (_sourceListeners.TryGetValue(source, out var sourceListeners))
 					{
 						enumerator.SourceListeners = sourceListeners;
+					}
+				}
+
+				if (!targetIsDefault && !sourceIsDefault)
+				{
+
+					if (_sourceAndTargetListeners.TryGetValue((source, target), out var sourceAndTargetListeners))
+					{
+						enumerator.SourceAndTargetListeners = sourceAndTargetListeners;
 					}
 				}
 
@@ -543,9 +654,11 @@ namespace GenericEventBus
 				public int Index;
 				public int TargetIndex;
 				public int SourceIndex;
+				public int SourceAndTargetIndex;
 				public List<Listener> SortedListeners;
 				public List<Listener> TargetListeners;
 				public List<Listener> SourceListeners;
+				public List<Listener> SourceAndTargetListeners;
 				public TObject Target;
 				public TObject Source;
 				public float LastPriority = float.MaxValue;
@@ -605,6 +718,27 @@ namespace GenericEventBus
 								index = ref SourceIndex;
 							}
 						}
+
+						var sourceAndTargetListenerCount = SourceAndTargetListeners?.Count ?? 0;
+
+						if (sourceAndTargetListenerCount > 0 && SourceAndTargetIndex < sourceAndTargetListenerCount)
+						{
+							var sourceAndTargetListener = SourceAndTargetListeners[SourceAndTargetIndex];
+
+							if (nextListener.HasValue)
+							{
+								if (sourceAndTargetListener.Priority > nextListener.Value.Priority)
+								{
+									nextListener = sourceAndTargetListener;
+									index = ref SourceAndTargetIndex;
+								}
+							}
+							else
+							{
+								nextListener = sourceAndTargetListener;
+								index = ref SourceAndTargetIndex;
+							}
+						}
 					} while (nextListener.HasValue && nextListener.Value.Priority > LastPriority);
 
 					if (nextListener.HasValue)
@@ -633,9 +767,11 @@ namespace GenericEventBus
 					Index = 0;
 					TargetIndex = 0;
 					SourceIndex = 0;
+					SourceAndTargetIndex = 0;
 					SortedListeners = null;
 					TargetListeners = null;
 					SourceListeners = null;
+					SourceAndTargetListeners = null;
 					Target = default;
 					Source = default;
 					LastPriority = float.MaxValue;
@@ -656,6 +792,7 @@ namespace GenericEventBus
 				_sortedListeners.Clear();
 				_targetListeners.Clear();
 				_sourceListeners.Clear();
+				_sourceAndTargetListeners.Clear();
 			}
 		}
 	}
